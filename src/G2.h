@@ -39,10 +39,8 @@ template<typename Function, typename F = typename std::remove_reference<Function
 using function_signature = std::conditional<
     std::is_function<F>::value,
     F,
-    typename std::conditional<
-        std::is_pointer<F>::value || std::is_member_pointer<F>::value,
-        typename std::remove_pointer<F>::type,
-        typename strip_function_object<F>::type>::type>;
+    typename strip_function_object<F>::type
+>;
 
 template<typename T, typename T0 = typename std::remove_reference<T>::type>
 using is_lambda = std::integral_constant<bool, !std::is_function<T0>::value && !std::is_pointer<T0>::value && !std::is_member_pointer<T0>::value>;
@@ -107,6 +105,7 @@ inline std::ostream &operator<<(std::ostream &stream, SingleArg::Kind k) {
         "Function",
         "Buffer",
     };
+    abort();
     stream << kinds[(int)k];
     return stream;
 }
@@ -198,6 +197,18 @@ struct SingleArgInferrer {
 };
 
 template<>
+inline SingleArg SingleArgInferrer<Type>::operator()() {
+    const Type t = Handle();  // TODO: fake Type as 'handle' for now
+    return SingleArg{"", SingleArg::Kind::Constant, {t}, 0};
+}
+
+template<>
+inline SingleArg SingleArgInferrer<std::string>::operator()() {
+    const Type t = Handle();  // TODO: fake string as 'handle' for now
+    return SingleArg{"", SingleArg::Kind::Constant, {t}, 0};
+}
+
+template<>
 inline SingleArg SingleArgInferrer<Func>::operator()() {
     return SingleArg{"", SingleArg::Kind::Function, {}, -1};  // TODO: can't tell type or dims, must put in input()
 }
@@ -209,15 +220,153 @@ inline SingleArg SingleArgInferrer<Expr>::operator()() {
 
 // ---------------------------------------
 
+struct FnInvoker {
+    virtual Pipeline invoke(const std::map<std::string, std::string> &constants) = 0;
+
+    virtual std::vector<Parameter> get_parameters_for_input(const std::string &name) = 0;
+
+    FnInvoker() = default;
+    virtual ~FnInvoker() = default;
+
+    // Not movable, not copyable
+    FnInvoker &operator=(const FnInvoker &) = delete;
+    FnInvoker(const FnInvoker &) = delete;
+    FnInvoker &operator=(FnInvoker &&) = delete;
+    FnInvoker(FnInvoker &&) = delete;
+};
+
+
+// ---------------------------------------
+
+struct CapturedArg {
+    std::string name;
+    Parameter p;
+    Func f;
+    Expr e;
+    std::string str;
+
+    using StrMap = std::map<std::string, std::string>;
+
+    template<typename T>
+    T value(const StrMap &m) const;
+
+    std::string get_string(const StrMap &m) const {
+        auto it = m.find(name);
+        if (it != m.end()) {
+            std::cerr << "Replace [" << name << "] str " << str << " -> " << it->second << "\n";
+            return it->second;
+        } else {
+            std::cerr << "Use [" << name << "] str " << str << "\n";
+            return str;
+        }
+    }
+};
+
+template<>
+inline Expr CapturedArg::value<Expr>(const StrMap &m) const {
+    return e;
+}
+
+template<>
+inline Func CapturedArg::value<Func>(const StrMap &m) const {
+    return f;
+}
+
+template<>
+inline std::string CapturedArg::value<std::string>(const StrMap &m) const {
+    const std::string s = get_string(m);
+    return s;
+}
+
+template<>
+inline Type CapturedArg::value<Type>(const StrMap &m) const {
+    const std::string s = get_string(m);
+    const auto &types = get_halide_type_enum_map();
+    const auto it = types.find(s);
+    user_assert(it != types.end()) << "The string " << s << " cannot be parsed as a Halide type.";
+    return it->second;
+}
+
+template<>
+inline bool CapturedArg::value<bool>(const StrMap &m) const {
+    const std::string s = get_string(m);
+    bool b = false;
+    if (s == "true") {
+        b = true;
+    } else if (s == "false") {
+        b = false;
+    } else {
+        user_assert(false) << "Unable to parse bool: " << s;
+    }
+    return b;
+}
+
+template<typename T>
+inline T CapturedArg::value(const StrMap &m) const {
+    const std::string s = get_string(m);
+    static_assert(std::is_arithmetic<T>::value && !std::is_same<T, bool>::value, "Expected only arithmetic types here.");
+    std::istringstream iss(s);
+    T t;
+    // All one-byte ints int8 and uint8 should be parsed as integers, not chars.
+    if (sizeof(T) == sizeof(char)) {
+        int i;
+        iss >> i;
+        t = (T)i;
+    } else {
+        iss >> t;
+    }
+    user_assert(!iss.fail() && iss.get() == EOF) << "Unable to parse " << type_of<T>() << ": " << s;
+    return t;
+}
+
+// ---------------------------------------
+template <typename ReturnType, typename... Args>
+struct CapturedFn : public FnInvoker {
+    std::function<ReturnType(Args...)> fn;
+    std::array<CapturedArg, sizeof...(Args)> args;
+
+    CapturedFn() = default;
+
+    Pipeline invoke(const std::map<std::string, std::string> &constants) override {
+        return invoke_impl(constants, std::make_index_sequence<sizeof...(Args)>());
+    }
+
+    std::vector<Parameter> get_parameters_for_input(const std::string &name) override {
+        for (const auto &a : args) {
+            if (a.name == name) {
+                return {a.p};
+            }
+        }
+        user_assert(false) << "Unknown input: " << name;
+        return {};
+    }
+
+private:
+    template <size_t... Is>
+    Pipeline invoke_impl(const std::map<std::string, std::string> &constants, std::index_sequence<Is...>) {
+        using T = std::tuple<Args...>;
+        return fn(std::get<Is>(args).template value<typename std::decay<decltype(std::get<Is>(T()))>::type>(constants)...);
+    }
+
+    // Not movable, not copyable
+    CapturedFn &operator=(const CapturedFn &) = delete;
+    CapturedFn(const CapturedFn &) = delete;
+    CapturedFn &operator=(CapturedFn &&) = delete;
+    CapturedFn(CapturedFn &&) = delete;
+};
+
+// ---------------------------------------
+
 using ArgInfo = AbstractGenerator::ArgInfo;
 
 class FnBinder {
 public:
-    // Movable but not copyable
     FnBinder() = delete;
-    void operator=(const FnBinder &) = delete;
-    void operator=(FnBinder &&) = delete;
-    FnBinder(const FnBinder &) = default;
+
+    // Movable but not copyable
+    FnBinder &operator=(const FnBinder &) = delete;
+    FnBinder(const FnBinder &) = delete;
+    FnBinder &operator=(FnBinder &&) = default;
     FnBinder(FnBinder &&) = default;
 
     struct InputOrConstant : public SingleArg {
@@ -227,6 +376,7 @@ public:
     };
 
     struct Constant : public InputOrConstant {
+        // TODO: add a templated ctor to allow for typed construction
         explicit Constant(const std::string &n, const std::string &s)
             : InputOrConstant(n, SingleArg::Kind::Constant, std::vector<Type>{}, 0, s) {
         }
@@ -278,12 +428,12 @@ public:
 
     // Construct an FnBinder from an ordinary function
     template<typename ReturnType, typename... Args>
-    FnBinder(ReturnType (*fn)(Args...), const std::vector<InputOrConstant> &inputs, const Output &output){
+    FnBinder(ReturnType (*fn)(Args...), const std::vector<InputOrConstant> &inputs, const Output &output) {
 std::cerr << "CTOR #1\n";
         initialize(fn, fn, inputs, output);
     }
 
-    // Construct an FnBinder from a lambda function (possibly with internal state)
+    // Construct an FnBinder from a lambda or std::function (possibly with internal state)
     template<typename Fn, // typename... Inputs,
              typename std::enable_if<is_lambda<Fn>::value>::type * = nullptr>
     FnBinder(Fn &&fn, const std::vector<InputOrConstant> &inputs, const Output &output){
@@ -299,6 +449,10 @@ std::cerr << "CTOR #2\n";
     }
     std::vector<ArgInfo> outputs() const {
         return outputs_;
+    }
+
+    std::shared_ptr<FnInvoker> invoker() const {
+        return invoker_;
     }
 
     void inspect() const {
@@ -317,11 +471,9 @@ protected:
     std::vector<Constant> constants_;
     std::vector<ArgInfo> inputs_;
     std::vector<ArgInfo> outputs_;
+    std::shared_ptr<FnInvoker> invoker_;
 
     IOKind to_iokind(SingleArg::Kind k) {
-        std::ostringstream oss;
-        oss << k;
-        std::cerr << oss.str();
         switch (k) {
         default:
             internal_error << "Unhandled SingleArg::Kind: " << k;
@@ -343,28 +495,64 @@ protected:
         };
     }
 
+    Func make_param_func(const Parameter &p, const std::string &name) {
+        internal_assert(p.is_buffer());
+        Func f(name + "_im");
+        auto b = p.buffer();
+        if (b.defined()) {
+            // If the Parameter has an explicit BufferPtr set, bind directly to it
+            f(_) = b(_);
+        } else {
+            std::vector<Var> args;
+            std::vector<Expr> args_expr;
+            for (int i = 0; i < p.dimensions(); ++i) {
+                Var v = Var::implicit(i);
+                args.push_back(v);
+                args_expr.push_back(v);
+            }
+            f(args) = Internal::Call::make(p, args_expr);
+        }
+        return f;
+    }
+
     template<typename Fn, typename ReturnType, typename... Args>
     void initialize(Fn &&fn, ReturnType (*)(Args...), const std::vector<InputOrConstant> &inputs, const Output &output) {
-        // struct CapturedFn {
-        //     std::remove_reference<Fn>::type fn;
-        // };
-
         user_assert(sizeof...(Args) == inputs.size()) << "The number of argument annotations does not match the number of function arguments";
 
         const std::array<SingleArg, sizeof...(Args)> inferred_arg_types = {SingleArgInferrer<typename std::decay<Args>::type>()()...};
         internal_assert(inferred_arg_types.size() == inputs.size());
 
+        using CapFn = CapturedFn<ReturnType, Args...>;
+        auto captured = std::make_unique<CapFn>();
+        captured->fn = std::move(fn);
+
         for (size_t i = 0; i < inputs.size(); ++i) {
             const bool is_constant = (inferred_arg_types[i].kind == SingleArg::Kind::Constant);
             const bool skip_default_value = !is_constant;
             const SingleArg matched = SingleArg::match(inputs[i], inferred_arg_types[i], skip_default_value);
+
+            CapturedArg &carg = captured->args[i];
+            carg.name = matched.name;
             if (inferred_arg_types[i].kind == SingleArg::Kind::Constant) {
                 constants_.emplace_back(matched.name, matched.default_value);
                 constants_.back().types = matched.types;
+
+                carg.str = matched.default_value;
             } else {
                 inputs_.push_back(to_arginfo(matched));
+
+                internal_assert(matched.types.size() == 1) << "multi-type not handled TODO";
+                const bool is_buffer = inferred_arg_types[i].kind != SingleArg::Kind::Expression;
+                carg.p = Parameter(matched.types[0], is_buffer, matched.dimensions, carg.name);
+                if (is_buffer) {
+                    carg.f = make_param_func(carg.p, carg.name);
+                } else {
+                    carg.e = Internal::Variable::make(matched.types[0], carg.name, carg.p);
+                }
             }
         }
+
+        invoker_.reset(captured.release());
 
         // TODO: handle Halide::Tuple here
         const SingleArg inferred_ret_type = SingleArgInferrer<typename std::decay<ReturnType>::type>()();
@@ -380,6 +568,7 @@ class G2Generator : public AbstractGenerator {
     const std::string name_;
     const std::vector<ArgInfo> inputs_, outputs_;
     std::map<std::string, std::string> generatorparams_;
+    std::shared_ptr<FnInvoker> invoker_;
 
     Pipeline pipeline_;
 
@@ -392,12 +581,13 @@ class G2Generator : public AbstractGenerator {
     }
 
 public:
-    explicit G2Generator(const GeneratorContext &context, const std::string &name, const FnBinder &detector)
+    explicit G2Generator(const GeneratorContext &context, const std::string &name, const FnBinder &binder)
         : target_info_{context.get_target(), context.get_auto_schedule(), context.get_machine_params()},
           name_(name),
-          inputs_(detector.inputs()),
-          outputs_(detector.outputs()),
-          generatorparams_(init_generatorparams(detector.constants())) {
+          inputs_(binder.inputs()),
+          outputs_(binder.outputs()),
+          generatorparams_(init_generatorparams(binder.constants())),
+          invoker_(binder.invoker()) {
     }
 
     std::string get_name() override {
@@ -441,25 +631,28 @@ public:
     void bind_input(const std::string &name, const std::vector<Parameter> &v) override {
         user_assert(!pipeline_.defined())
             << "bind_input() must be called before build_pipeline().";
-        internal_error << "Unimplemented: " << __FILE__ << ":" << __LINE__;
+        internal_error << "Unimplemented: " << __func__;
     }
 
     void bind_input(const std::string &name, const std::vector<Func> &v) override {
         user_assert(!pipeline_.defined())
             << "bind_input() must be called before build_pipeline().";
-        internal_error << "Unimplemented: " << __FILE__ << ":" << __LINE__;
+        internal_error << "Unimplemented: " << __func__;
     }
 
     void bind_input(const std::string &name, const std::vector<Expr> &v) override {
         user_assert(!pipeline_.defined())
             << "bind_input() must be called before build_pipeline().";
-        internal_error << "Unimplemented: " << __FILE__ << ":" << __LINE__;
+        internal_error << "Unimplemented: " << __func__;
     }
 
     Pipeline build_pipeline() override {
         user_assert(!pipeline_.defined())
             << "build_pipeline() may not be called twice.";
 
+        pipeline_ = invoker_->invoke(generatorparams_);
+
+        internal_assert(outputs_.size() == pipeline_.outputs().size());
         // const int scaling = string_to_int(generatorparams_.at("scaling"));
 
         // Var x, y;
@@ -475,52 +668,46 @@ public:
     std::vector<Parameter> get_parameters_for_input(const std::string &name) override {
         user_assert(pipeline_.defined())
             << "get_parameters_for_input() must be called after build_pipeline().";
-        internal_error << "Unimplemented: " << __FILE__ << ":" << __LINE__;
-        // if (name == "input") {
-        //     return {input_.parameter()};
-        // }
-        // if (name == "offset") {
-        //     return {offset_.parameter()};
-        // }
-        // user_assert(false) << "Unknown input: " << name;
-        return {};
+        return invoker_->get_parameters_for_input(name);
     }
 
     std::vector<Func> get_funcs_for_output(const std::string &name) override {
         user_assert(pipeline_.defined())
             << "get_funcs_for_output() must be called after build_pipeline().";
-        internal_error << "Unimplemented: " << __FILE__ << ":" << __LINE__;
-        // if (name == "output") {
-        //     return {output_};
-        // }
-        // internal_assert(false) << "Unknown output: " << name;
+        auto outputs = pipeline_.outputs();
+
+        internal_assert(outputs_.size() == outputs.size());
+        for (size_t i = 0; i < outputs_.size(); i++) {
+            if (outputs_[i].name == name) {
+                return {outputs[i]};
+            }
+        }
+        internal_error << "Unknown output: " << name;
         return {};
     }
 
     ExternsMap get_external_code_map() override {
         user_assert(pipeline_.defined())
             << "get_external_code_map() must be called after build_pipeline().";
-        internal_error << "Unimplemented: " << __FILE__ << ":" << __LINE__;
         // TODO: not supported now; how necessary and/or doable is this?
         return {};
     }
 
     bool emit_cpp_stub(const std::string & /*stub_file_path*/) override {
         // not supported
-        internal_error << "Unimplemented: " << __FILE__ << ":" << __LINE__;
         return false;
     }
 };
 
 class G2GeneratorFactory {
     const std::string name_;
-    const FnBinder detector_;
+    const FnBinder binder_;
 public:
-    explicit G2GeneratorFactory(const std::string name, FnBinder &&detector) : name_(name), detector_(std::move(detector)) {
+    explicit G2GeneratorFactory(const std::string name, FnBinder &&binder) : name_(name), binder_(std::move(binder)) {
     }
 
     std::unique_ptr<AbstractGenerator> operator()(const GeneratorContext &context) {
-        return std::unique_ptr<AbstractGenerator>(new G2Generator(context, name_, detector_));
+        return std::unique_ptr<AbstractGenerator>(new G2Generator(context, name_, binder_));
     }
 };
 

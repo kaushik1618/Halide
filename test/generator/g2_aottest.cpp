@@ -21,8 +21,6 @@ void verify(const Buffer<int32_t> &img, float compiletime_factor, float runtime_
 
 int main(int argc, char **argv) {
 
-    const int32_t scaling = 2;  // GeneratorParam
-
     Buffer<int32_t> input(kSize, kSize);
     const int32_t offset = 32;
 
@@ -34,6 +32,7 @@ int main(int argc, char **argv) {
 
     g2(input, offset, output);
     output.for_each_element([&](int x, int y) {
+        const int32_t scaling = 2;  // GeneratorParam
         int expected = (x + y) * scaling + offset;
         int actual = output(x, y);
         if (expected != actual) {
@@ -44,6 +43,7 @@ int main(int argc, char **argv) {
 
     g2_lambda(input, offset, output);
     output.for_each_element([&](int x, int y) {
+        const int32_t scaling = 33;  // GeneratorParam
         int expected = (x + y) * scaling + offset;
         int actual = output(x, y);
         if (expected != actual) {
