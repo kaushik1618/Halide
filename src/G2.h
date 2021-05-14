@@ -4,6 +4,25 @@
 #include <iostream>
 #include <sstream>
 
+struct halide_fake_string_type_t {};
+struct halide_fake_type_type_t {};
+
+template<>
+struct halide_c_type_to_name<halide_fake_string_type_t> {
+    static constexpr bool known_type = true;
+    static halide_cplusplus_type_name name() {
+        return {halide_cplusplus_type_name::Simple, "std::string"};
+    }
+};
+
+template<>
+struct halide_c_type_to_name<halide_fake_type_type_t> {
+    static constexpr bool known_type = true;
+    static halide_cplusplus_type_name name() {
+        return {halide_cplusplus_type_name::Simple, "Halide::Type"};
+    }
+};
+
 namespace Halide {
 
 inline std::ostream &operator<<(std::ostream &stream, const std::vector<Type> &v) {
@@ -39,8 +58,7 @@ template<typename Function, typename F = typename std::remove_reference<Function
 using function_signature = std::conditional<
     std::is_function<F>::value,
     F,
-    typename strip_function_object<F>::type
->;
+    typename strip_function_object<F>::type>;
 
 template<typename T, typename T0 = typename std::remove_reference<T>::type>
 using is_lambda = std::integral_constant<bool, !std::is_function<T0>::value && !std::is_pointer<T0>::value && !std::is_member_pointer<T0>::value>;
@@ -105,7 +123,6 @@ inline std::ostream &operator<<(std::ostream &stream, SingleArg::Kind k) {
         "Function",
         "Buffer",
     };
-    abort();
     stream << kinds[(int)k];
     return stream;
 }
@@ -144,10 +161,10 @@ template<typename T>
     if (a_spec) {
         if (i_spec) {
             user_assert(annotated == inferred)
-                    << "Unable to resolve signature for Generator argument '" << name << "': "
-                    << "The explicitly-specified value for field '" << field
-                    << "' was '" << annotated
-                    << "', which does not match the inferred value '" << inferred << "'.";
+                << "Unable to resolve signature for Generator argument '" << name << "': "
+                << "The explicitly-specified value for field '" << field
+                << "' was '" << annotated
+                << "', which does not match the inferred value '" << inferred << "'.";
         }
         return annotated;
     } else {
@@ -188,7 +205,6 @@ template<typename T>
 struct SingleArgInferrer {
     inline SingleArg operator()() {
         const Type t = type_of<T>();
-        // TODO: also allow std::string
         if (t.is_scalar() && (t.is_int() || t.is_uint() || t.is_float())) {
             return SingleArg{"", SingleArg::Kind::Constant, {t}, 0};
         }
@@ -198,13 +214,13 @@ struct SingleArgInferrer {
 
 template<>
 inline SingleArg SingleArgInferrer<Type>::operator()() {
-    const Type t = Handle();  // TODO: fake Type as 'handle' for now
+    const Type t = type_of<halide_fake_type_type_t *>();
     return SingleArg{"", SingleArg::Kind::Constant, {t}, 0};
 }
 
 template<>
 inline SingleArg SingleArgInferrer<std::string>::operator()() {
-    const Type t = Handle();  // TODO: fake string as 'handle' for now
+    const Type t = type_of<halide_fake_string_type_t*>();
     return SingleArg{"", SingleArg::Kind::Constant, {t}, 0};
 }
 
@@ -235,7 +251,6 @@ struct FnInvoker {
     FnInvoker(FnInvoker &&) = delete;
 };
 
-
 // ---------------------------------------
 
 struct CapturedArg {
@@ -253,10 +268,10 @@ struct CapturedArg {
     std::string get_string(const StrMap &m) const {
         auto it = m.find(name);
         if (it != m.end()) {
-            std::cerr << "Replace [" << name << "] str " << str << " -> " << it->second << "\n";
+            // std::cerr << "Replace [" << name << "] str " << str << " -> " << it->second << "\n";  TODO
             return it->second;
         } else {
-            std::cerr << "Use [" << name << "] str " << str << "\n";
+            // std::cerr << "Use [" << name << "] str " << str << "\n";  TODO
             return str;
         }
     }
@@ -320,7 +335,7 @@ inline T CapturedArg::value(const StrMap &m) const {
 }
 
 // ---------------------------------------
-template <typename ReturnType, typename... Args>
+template<typename ReturnType, typename... Args>
 struct CapturedFn : public FnInvoker {
     std::function<ReturnType(Args...)> fn;
     std::array<CapturedArg, sizeof...(Args)> args;
@@ -342,7 +357,7 @@ struct CapturedFn : public FnInvoker {
     }
 
 private:
-    template <size_t... Is>
+    template<size_t... Is>
     Pipeline invoke_impl(const std::map<std::string, std::string> &constants, std::index_sequence<Is...>) {
         using T = std::tuple<Args...>;
         return fn(std::get<Is>(args).template value<typename std::decay<decltype(std::get<Is>(T()))>::type>(constants)...);
@@ -369,16 +384,55 @@ public:
     FnBinder &operator=(FnBinder &&) = default;
     FnBinder(FnBinder &&) = default;
 
+private:
+    struct TypeAndString {
+        Type type;
+        std::string str;
+    };
+
+    template<typename T>
+    inline static TypeAndString get_type_and_string(T value) {
+        static_assert(std::is_arithmetic<T>::value && !std::is_same<T, bool>::value, "Expected only arithmetic types here.");
+        return {type_of<T>(), std::to_string(value)};
+    }
+
+    template<>
+    inline /*static*/ TypeAndString get_type_and_string(Type value) {
+        std::ostringstream oss;
+        oss << value;
+        return {type_of<halide_fake_type_type_t*>(), oss.str()};
+    }
+
+    template<>
+    inline /*static*/ TypeAndString get_type_and_string(std::string value) {
+        return {type_of<halide_fake_string_type_t*>(), value};
+    }
+
+    template<>
+    inline /*static*/ TypeAndString get_type_and_string(const char *value) {
+        return get_type_and_string<std::string>(std::string(value));
+    }
+
+    template<>
+    inline /*static*/ TypeAndString get_type_and_string(bool value) {
+        return {type_of<bool>(), value ? "true" : "false"};
+    }
+
+public:
     struct InputOrConstant : public SingleArg {
-        explicit InputOrConstant(const std::string &n, SingleArg::Kind k, const std::vector<Type> &t, int d, const std::string &s = "")
+        InputOrConstant(const std::string &n, SingleArg::Kind k, const std::vector<Type> &t, int d, const std::string &s = "")
             : SingleArg(n, k, t, d, s) {
+        }
+        InputOrConstant(const std::string &n, SingleArg::Kind k, int d, const TypeAndString &t_and_s)
+            : SingleArg(n, k, {t_and_s.type}, d, t_and_s.str) {
         }
     };
 
     struct Constant : public InputOrConstant {
         // TODO: add a templated ctor to allow for typed construction
-        explicit Constant(const std::string &n, const std::string &s)
-            : InputOrConstant(n, SingleArg::Kind::Constant, std::vector<Type>{}, 0, s) {
+        template<typename T>
+        Constant(const std::string &n, const T &value)
+            : InputOrConstant(n, SingleArg::Kind::Constant, 0, get_type_and_string(value)) {
         }
     };
 
@@ -429,15 +483,13 @@ public:
     // Construct an FnBinder from an ordinary function
     template<typename ReturnType, typename... Args>
     FnBinder(ReturnType (*fn)(Args...), const std::vector<InputOrConstant> &inputs, const Output &output) {
-std::cerr << "CTOR #1\n";
         initialize(fn, fn, inputs, output);
     }
 
     // Construct an FnBinder from a lambda or std::function (possibly with internal state)
-    template<typename Fn, // typename... Inputs,
+    template<typename Fn,  // typename... Inputs,
              typename std::enable_if<is_lambda<Fn>::value>::type * = nullptr>
-    FnBinder(Fn &&fn, const std::vector<InputOrConstant> &inputs, const Output &output){
-std::cerr << "CTOR #2\n";
+    FnBinder(Fn &&fn, const std::vector<InputOrConstant> &inputs, const Output &output) {
         initialize(std::forward<Fn>(fn), (typename function_signature<Fn>::type *)nullptr, inputs, output);
     }
 
@@ -702,8 +754,10 @@ public:
 class G2GeneratorFactory {
     const std::string name_;
     const FnBinder binder_;
+
 public:
-    explicit G2GeneratorFactory(const std::string name, FnBinder &&binder) : name_(name), binder_(std::move(binder)) {
+    explicit G2GeneratorFactory(const std::string name, FnBinder &&binder)
+        : name_(name), binder_(std::move(binder)) {
     }
 
     std::unique_ptr<AbstractGenerator> operator()(const GeneratorContext &context) {
