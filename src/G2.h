@@ -268,10 +268,8 @@ struct CapturedArg {
     std::string get_string(const StrMap &m) const {
         auto it = m.find(name);
         if (it != m.end()) {
-            // std::cerr << "Replace [" << name << "] str " << str << " -> " << it->second << "\n";  TODO
             return it->second;
         } else {
-            // std::cerr << "Use [" << name << "] str " << str << "\n";  TODO
             return str;
         }
     }
@@ -507,18 +505,6 @@ public:
         return invoker_;
     }
 
-    void inspect() const {
-        for (const auto &a : constants_) {
-            std::cout << "  constant: " << a << "\n";
-        }
-        for (const auto &a : inputs_) {
-            std::cout << "  in: " << a << "\n";
-        }
-        for (const auto &a : outputs_) {
-            std::cout << "  out: " << a << "\n";
-        }
-    }
-
 protected:
     std::vector<Constant> constants_;
     std::vector<ArgInfo> inputs_;
@@ -604,7 +590,7 @@ protected:
             }
         }
 
-        invoker_.reset(captured.release());
+        invoker_ = std::move(captured);
 
         // TODO: handle Halide::Tuple here
         const SingleArg inferred_ret_type = SingleArgInferrer<typename std::decay<ReturnType>::type>()();
@@ -761,7 +747,7 @@ public:
     }
 
     std::unique_ptr<AbstractGenerator> operator()(const GeneratorContext &context) {
-        return std::unique_ptr<AbstractGenerator>(new G2Generator(context, name_, binder_));
+        return std::make_unique<G2Generator>(context, name_, binder_);
     }
 };
 
