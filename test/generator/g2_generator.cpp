@@ -6,10 +6,10 @@ namespace Halide {
 namespace Testing {
 
 // TODO: buffers. imageparams? outputbuffers?
+// TODO: pass in targetinfo.
+Var x, y;
 
 Func g2_func_impl(Func input, Expr offset, int scaling) {
-    Var x, y;
-
     Func output;
     output(x, y) = input(x, y) * scaling + offset;
     output.compute_root();
@@ -19,16 +19,13 @@ Func g2_func_impl(Func input, Expr offset, int scaling) {
 
 const auto g2_lambda_impl = [](Func input, Expr offset, int scaling,
                                Type ignored_type, bool ignored_bool, std::string ignored_string, int8_t ignored_int8) {
-    Var x, y;
-
     std::cout << "Ignoring type: " << ignored_type << "\n";
     std::cout << "Ignoring bool: " << (int)ignored_bool << "\n";
     std::cout << "Ignoring string: " << ignored_string << "\n";
     std::cout << "Ignoring int8: " << (int)ignored_int8 << "\n";
 
-    Func output;
-    output(x, y) = input(x, y) * scaling + offset;
-    output.compute_root();
+    Func output = g2_func_impl(input, offset, scaling);
+    // TODO output.vectorize(x, Target::natural_vector_size<int32_t>());
 
     return output;
 };
